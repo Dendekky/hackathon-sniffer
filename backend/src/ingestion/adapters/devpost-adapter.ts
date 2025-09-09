@@ -10,7 +10,7 @@ export class DevpostAdapter extends BaseAdapter {
   private browser: Browser | null = null;
 
   protected getScrapingPaths(): string[] {
-    return ['/hackathons', '/hackathons/open'];
+    return ['/hackathons'];
   }
 
   async scrape(): Promise<NormalizedHackathon[]> {
@@ -126,9 +126,9 @@ export class DevpostAdapter extends BaseAdapter {
       // Try multiple endpoints that might contain hackathon data
       const endpoints = [
         '/hackathons',
-        '/hackathons/open',
         '/api/hackathons', // API endpoint possibility
-        '/challenges' // Alternative naming
+        '/software-competitions',
+        '/virtual-hackathons'
       ];
       
       for (const endpoint of endpoints) {
@@ -138,6 +138,22 @@ export class DevpostAdapter extends BaseAdapter {
           
           const html = await this.httpClient.get(url, this.source_id);
           const $ = cheerio.load(html);
+          
+          // For API endpoints, try to parse as JSON directly
+          if (endpoint.includes('/api/')) {
+            try {
+              console.log(`[${this.source_id}] Attempting to parse API response as JSON`);
+              const jsonData = JSON.parse(html);
+              const extractedHackathons = this.extractHackathonsFromJson(jsonData);
+              if (extractedHackathons.length > 0) {
+                hackathons.push(...extractedHackathons);
+                console.log(`[${this.source_id}] Successfully extracted ${extractedHackathons.length} hackathons from API JSON`);
+                break;
+              }
+            } catch (jsonError) {
+              console.log(`[${this.source_id}] API response is not valid JSON, trying HTML parsing`);
+            }
+          }
           
           // Try to find JSON data embedded in the page
           const jsonScripts = $('script[type="application/json"]');
@@ -171,13 +187,27 @@ export class DevpostAdapter extends BaseAdapter {
             break;
           }
           
+          // Try parsing with modern Devpost selectors
+          const modernHackathons = this.parseModernDevpostPage($);
+          if (modernHackathons.length > 0) {
+            hackathons.push(...modernHackathons);
+            console.log(`[${this.source_id}] Extracted ${modernHackathons.length} hackathons from modern page structure`);
+            break;
+          }
+          
+          // Debug: Log some info about the page structure
+          console.log(`[${this.source_id}] Page title: ${$('title').text().substring(0, 100)}`);
+          console.log(`[${this.source_id}] Total links found: ${$('a').length}`);
+          console.log(`[${this.source_id}] Links with "hackathon" in href: ${$('a[href*="hackathon"]').length}`);
+          console.log(`[${this.source_id}] Links with "software" in href: ${$('a[href*="software"]').length}`);
+          
           // Try to find any links that look like hackathons
           const hackathonLinks = this.extractHackathonLinks($);
           if (hackathonLinks.length > 0) {
             console.log(`[${this.source_id}] Found ${hackathonLinks.length} potential hackathon links`);
             
             // Process a subset of links to avoid overwhelming the system
-            for (const link of hackathonLinks.slice(0, 10)) {
+            for (const link of hackathonLinks.slice(0, 5)) {
               try {
                 const hackathon = await this.processHackathonLink(link);
                 if (hackathon) {
@@ -230,7 +260,7 @@ export class DevpostAdapter extends BaseAdapter {
     }
   }
 
-  private async parseHackathonElement($: cheerio.CheerioAPI, element: cheerio.Cheerio<any>): Promise<NormalizedHackathon | null> {
+  private async parseHackathonElement(_$: cheerio.CheerioAPI, element: cheerio.Cheerio<any>): Promise<NormalizedHackathon | null> {
     try {
       // Try multiple approaches to extract hackathon data
       
@@ -316,68 +346,6 @@ export class DevpostAdapter extends BaseAdapter {
     }
   }
 
-  private async parseHackathonCard(_$: cheerio.CheerioAPI, card: cheerio.Cheerio<any>): Promise<NormalizedHackathon | null> {
-    try {
-      // Extract basic info
-      const titleElement = card.find('.challenge-title a');
-      const title = this.cleanText(titleElement.text());
-      const relativeUrl = titleElement.attr('href');
-      
-      if (!title || !relativeUrl) {
-        console.warn(`[${this.source_id}] Skipping card with missing title or URL`);
-        return null;
-      }
-
-      const website_url = `${this.baseUrl}${relativeUrl}`;
-
-      // Extract dates
-      const dateText = this.cleanText(card.find('.challenge-date').text());
-      const dates = this.parseDateRange(dateText);
-      
-      if (!dates) {
-        console.warn(`[${this.source_id}] Skipping card with unparseable dates: ${dateText}`);
-        return null;
-      }
-
-      // Extract location info
-      const locationElement = card.find('.challenge-location');
-      const locationText = this.cleanText(locationElement.text());
-      const { location, is_online } = this.parseLocation(locationText);
-
-      // Extract description (if available on card)
-      const description = this.cleanText(card.find('.challenge-description').text()) || undefined;
-
-      // Extract prize/theme info for additional context
-      const prizeText = this.cleanText(card.find('.challenge-prize').text());
-
-      const hackathon: NormalizedHackathon = {
-        title,
-        description: description || (prizeText ? `Prize: ${prizeText}` : undefined),
-        start_date: dates.start_date,
-        end_date: dates.end_date,
-        location,
-        is_online,
-        website_url,
-        source: 'devpost',
-      };
-
-      // Try to get more details from the individual hackathon page
-      try {
-        const detailedInfo = await this.getHackathonDetails(website_url);
-        Object.assign(hackathon, detailedInfo);
-      } catch (error) {
-        console.warn(`[${this.source_id}] Could not fetch details for ${website_url}:`, error);
-        // Continue with basic info
-      }
-
-      this.validateHackathon(hackathon);
-      return hackathon;
-
-    } catch (error) {
-      console.error(`[${this.source_id}] Error parsing hackathon card:`, error);
-      return null;
-    }
-  }
 
   private async getHackathonDetails(url: string): Promise<Partial<NormalizedHackathon>> {
     try {
@@ -509,17 +477,50 @@ export class DevpostAdapter extends BaseAdapter {
     const hackathons: NormalizedHackathon[] = [];
     
     try {
+      console.log(`[${this.source_id}] JSON data type: ${typeof data}, keys: ${Object.keys(data).slice(0, 10).join(', ')}`);
+      
       // Handle different JSON structures
       let items: any[] = [];
       
       if (Array.isArray(data)) {
         items = data;
+        console.log(`[${this.source_id}] Found array with ${items.length} items`);
       } else if (data.hackathons && Array.isArray(data.hackathons)) {
         items = data.hackathons;
+        console.log(`[${this.source_id}] Found hackathons array with ${items.length} items`);
       } else if (data.challenges && Array.isArray(data.challenges)) {
         items = data.challenges;
+        console.log(`[${this.source_id}] Found challenges array with ${items.length} items`);
       } else if (data.events && Array.isArray(data.events)) {
         items = data.events;
+        console.log(`[${this.source_id}] Found events array with ${items.length} items`);
+      } else if (data.data && Array.isArray(data.data)) {
+        items = data.data;
+        console.log(`[${this.source_id}] Found data array with ${items.length} items`);
+      } else if (data.results && Array.isArray(data.results)) {
+        items = data.results;
+        console.log(`[${this.source_id}] Found results array with ${items.length} items`);
+      } else {
+        // Try to find arrays in the data structure
+        for (const [key, value] of Object.entries(data)) {
+          if (Array.isArray(value) && value.length > 0) {
+            console.log(`[${this.source_id}] Found potential array at key '${key}' with ${value.length} items`);
+            // Check if first item looks like a hackathon
+            const firstItem = value[0];
+            if (firstItem && typeof firstItem === 'object' && 
+                (firstItem.title || firstItem.name || firstItem.challenge_title || 
+                 firstItem.url || firstItem.link || firstItem.website_url)) {
+              items = value;
+              console.log(`[${this.source_id}] Using array from key '${key}' as items`);
+              break;
+            }
+          }
+        }
+      }
+      
+      if (items.length === 0) {
+        console.log(`[${this.source_id}] No suitable array found in JSON data`);
+        return hackathons;
       }
       
       for (const item of items.slice(0, 20)) { // Limit to 20 items
@@ -541,26 +542,42 @@ export class DevpostAdapter extends BaseAdapter {
 
   private parseJsonHackathon(item: any): NormalizedHackathon | null {
     try {
-      const title = item.title || item.name || item.challenge_title;
-      const description = item.description || item.summary;
-      const url = item.url || item.link || item.website_url;
+      console.log(`[${this.source_id}] Parsing JSON item with keys: ${Object.keys(item).join(', ')}`);
       
-      if (!title || !url) {
+      const title = item.title || item.name || item.challenge_title || item.displayName;
+      const description = item.description || item.summary || item.tagline;
+      const url = item.url || item.link || item.website_url || item.href;
+      
+      if (!title) {
+        console.log(`[${this.source_id}] Skipping item - no title found`);
         return null;
       }
       
-      // Parse dates
-      const startDate = item.start_date || item.startDate || item.begins_at;
-      const endDate = item.end_date || item.endDate || item.ends_at;
+      if (!url) {
+        console.log(`[${this.source_id}] Skipping item - no URL found`);
+        return null;
+      }
       
+      // Parse dates - be more flexible
+      let startDate = item.start_date || item.startDate || item.begins_at || item.submission_period_dates?.start || item.open_date;
+      let endDate = item.end_date || item.endDate || item.ends_at || item.submission_period_dates?.end || item.close_date;
+      
+      // If no dates found, try to create reasonable defaults
       if (!startDate || !endDate) {
-        return null;
+        const now = new Date();
+        const future = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000); // 30 days from now
+        startDate = startDate || now.toISOString();
+        endDate = endDate || future.toISOString();
+        console.log(`[${this.source_id}] Using default dates for item: ${title}`);
       }
       
-      const location = item.location || 'Online';
-      const isOnline = item.is_online || item.virtual || location.toLowerCase().includes('online');
+      const location = item.location || item.venue || 'Online';
+      const isOnline = item.is_online || item.virtual || item.remote || 
+                      location.toLowerCase().includes('online') || 
+                      location.toLowerCase().includes('virtual') ||
+                      location.toLowerCase().includes('remote');
       
-      return {
+      const hackathon = {
         title: this.cleanText(title),
         description: description ? this.cleanText(description) : undefined,
         start_date: this.normalizeDate(startDate),
@@ -570,6 +587,9 @@ export class DevpostAdapter extends BaseAdapter {
         website_url: url.startsWith('http') ? url : `${this.baseUrl}${url}`,
         source: 'devpost',
       };
+      
+      console.log(`[${this.source_id}] Successfully parsed: ${hackathon.title}`);
+      return hackathon;
     } catch (error) {
       console.warn(`[${this.source_id}] Error parsing JSON hackathon:`, error);
       return null;
@@ -644,7 +664,7 @@ export class DevpostAdapter extends BaseAdapter {
     
     try {
       // Look for links that might be hackathons
-      $('a[href*="/hackathons/"], a[href*="/challenges/"]').each((_, link) => {
+      $('a[href*="/hackathons/"], a[href*="/challenges/"], a[href*="/software-competitions/"]').each((_, link) => {
         const href = $(link).attr('href');
         if (href && !href.includes('#') && !href.includes('?')) {
           const fullUrl = href.startsWith('http') ? href : `${this.baseUrl}${href}`;
@@ -658,6 +678,213 @@ export class DevpostAdapter extends BaseAdapter {
     }
     
     return links;
+  }
+
+  private parseModernDevpostPage($: cheerio.CheerioAPI): NormalizedHackathon[] {
+    const hackathons: NormalizedHackathon[] = [];
+    
+    try {
+      // Modern Devpost uses various selectors for hackathon cards
+      const possibleSelectors = [
+        '.challenge-item',
+        '.hackathon-item',
+        '.challenge-card',
+        '.hackathon-card',
+        '[data-testid*="challenge"]',
+        '[data-testid*="hackathon"]',
+        '.tile',
+        '.card',
+        'article',
+        '.challenge-tile'
+      ];
+      
+      for (const selector of possibleSelectors) {
+        const elements = $(selector);
+        if (elements.length > 0) {
+          console.log(`[${this.source_id}] Trying selector: ${selector} (${elements.length} elements)`);
+          
+          elements.each((index, element) => {
+            if (index >= 20) return false; // Limit to 20 items per selector
+            
+            try {
+              const $element = $(element);
+              const hackathon = this.parseModernHackathonElement($, $element);
+              if (hackathon) {
+                hackathons.push(hackathon);
+              }
+            } catch (error) {
+              console.warn(`[${this.source_id}] Error parsing element ${index}:`, error);
+            }
+            return true;
+          });
+          
+          if (hackathons.length > 0) {
+            console.log(`[${this.source_id}] Successfully parsed ${hackathons.length} hackathons with selector: ${selector}`);
+            break; // Use the first successful selector
+          }
+        }
+      }
+      
+      // If no structured elements found, try to extract from any links
+      if (hackathons.length === 0) {
+        console.log(`[${this.source_id}] No structured elements found, trying link-based approach`);
+        const links = $('a[href*="/software-competitions/"], a[href*="/hackathons/"], a[href*="/challenges/"]');
+        
+        links.each((index, link) => {
+          if (index >= 10) return false; // Limit to 10 links
+          
+          try {
+            const $link = $(link);
+            const href = $link.attr('href');
+            const text = this.cleanText($link.text());
+            
+            if (href && text && text.length > 5) {
+              // Create a basic hackathon entry from the link
+              const fullUrl = href.startsWith('http') ? href : `${this.baseUrl}${href}`;
+              
+              // Try to extract date info from surrounding context
+              const parent = $link.closest('div, article, section, li');
+              const contextText = this.cleanText(parent.text());
+              const dateMatch = contextText.match(/(\w{3,}\s+\d{1,2}(?:\s*[-–]\s*\d{1,2})?,?\s*\d{4})/);
+              
+              if (dateMatch) {
+                const dates = this.parseDateRange(dateMatch[1]);
+                if (dates) {
+                  hackathons.push({
+                    title: text,
+                    start_date: dates.start_date,
+                    end_date: dates.end_date,
+                    location: 'Online',
+                    is_online: true,
+                    website_url: fullUrl,
+                    source: 'devpost',
+                  });
+                }
+              }
+            }
+          } catch (error) {
+            console.warn(`[${this.source_id}] Error parsing link ${index}:`, error);
+          }
+          return true;
+        });
+      }
+    } catch (error) {
+      console.warn(`[${this.source_id}] Error in parseModernDevpostPage:`, error);
+    }
+    
+    return hackathons;
+  }
+
+  private parseModernHackathonElement(_$: cheerio.CheerioAPI, element: cheerio.Cheerio<any>): NormalizedHackathon | null {
+    try {
+      // Look for title in various places
+      let title = '';
+      const titleSelectors = ['h1', 'h2', 'h3', '.title', '.name', 'a', '[data-testid*="title"]'];
+      
+      for (const selector of titleSelectors) {
+        const titleElement = element.find(selector).first();
+        if (titleElement.length) {
+          title = this.cleanText(titleElement.text());
+          if (title && title.length > 3) break;
+        }
+      }
+      
+      if (!title) {
+        title = this.cleanText(element.text().split('\n')[0]); // Use first line as title
+      }
+      
+      if (!title || title.length < 3) {
+        return null;
+      }
+      
+      // Look for URL
+      let url = '';
+      const linkElement = element.find('a').first();
+      if (linkElement.length) {
+        const href = linkElement.attr('href');
+        if (href) {
+          url = href.startsWith('http') ? href : `${this.baseUrl}${href}`;
+        }
+      }
+      
+      if (!url) {
+        return null;
+      }
+      
+      // Extract date information from text content
+      const fullText = this.cleanText(element.text());
+      let dates = null;
+      
+      // Look for various date patterns
+      const datePatterns = [
+        /(\w{3,}\s+\d{1,2}(?:\s*[-–]\s*\d{1,2})?,?\s*\d{4})/g,
+        /(\d{1,2}\/\d{1,2}\/\d{4})/g,
+        /(\d{4}-\d{2}-\d{2})/g
+      ];
+      
+      for (const pattern of datePatterns) {
+        const matches = fullText.match(pattern);
+        if (matches && matches.length > 0) {
+          dates = this.parseDateRange(matches[0]);
+          if (dates) break;
+        }
+      }
+      
+      // If no dates found, try to infer from current context or use placeholder
+      if (!dates) {
+        // Use a placeholder date range (current date + 30 days)
+        const now = new Date();
+        const future = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
+        dates = {
+          start_date: this.normalizeDate(now.toISOString()),
+          end_date: this.normalizeDate(future.toISOString())
+        };
+      }
+      
+      // Extract location info
+      const locationKeywords = ['online', 'virtual', 'remote', 'in-person', 'hybrid'];
+      let location = 'Online';
+      let isOnline = true;
+      
+      const lowerText = fullText.toLowerCase();
+      for (const keyword of locationKeywords) {
+        if (lowerText.includes(keyword)) {
+          location = keyword.charAt(0).toUpperCase() + keyword.slice(1);
+          isOnline = ['online', 'virtual', 'remote'].includes(keyword);
+          break;
+        }
+      }
+      
+      // Extract description (try to get meaningful text)
+      let description = '';
+      const descriptionSelectors = ['.description', '.summary', 'p'];
+      
+      for (const selector of descriptionSelectors) {
+        const desc = this.cleanText(element.find(selector).text());
+        if (desc && desc.length > 20) {
+          description = desc.substring(0, 500); // Limit description length
+          break;
+        }
+      }
+      
+      const hackathon: NormalizedHackathon = {
+        title,
+        description: description || undefined,
+        start_date: dates.start_date,
+        end_date: dates.end_date,
+        location,
+        is_online: isOnline,
+        website_url: url,
+        source: 'devpost',
+      };
+      
+      this.validateHackathon(hackathon);
+      return hackathon;
+      
+    } catch (error) {
+      console.warn(`[${this.source_id}] Error parsing modern hackathon element:`, error);
+      return null;
+    }
   }
 
   private async processHackathonLink(url: string): Promise<NormalizedHackathon | null> {
