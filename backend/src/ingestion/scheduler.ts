@@ -2,6 +2,8 @@ import * as cron from 'node-cron';
 import { HttpClient } from './utils/http-client';
 import { DeduplicationService } from './utils/deduplication';
 import { DevpostAdapter } from './adapters/devpost-adapter';
+import { MLHAdapter } from './adapters/mlh-adapter';
+import { EventbriteAdapter } from './adapters/eventbrite-adapter';
 import { NormalizedHackathon, ScrapingResult, AdapterInterface } from './types/ingestion';
 
 // Import database utilities
@@ -31,7 +33,8 @@ export class IngestionScheduler {
     // Initialize adapters
     this.adapters = [
       new DevpostAdapter(this.httpClient),
-      // TODO: Add MLH and Eventbrite adapters
+      new MLHAdapter(this.httpClient),
+      new EventbriteAdapter(this.httpClient),
     ];
   }
 
